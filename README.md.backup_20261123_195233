@@ -1,0 +1,106 @@
+# Mini agente local Rocketbot - Clima
+
+Agente Python independiente que mantiene heartbeat y consulta una cola FastAPI.
+Mantiene `DRY_RUN=true` hasta comprobar oficialmente el lanzador y la licencia.
+El flujo real no usa Chrome, Selenium ni la interfaz web de Rocketbot.
+
+## Requisitos
+
+- Windows
+- Python 3.11 o superior
+- Google Chrome
+- Rocketbot Studio ejecutándose en `http://localhost:5000/`
+- API FastAPI disponible si se configura `API_BASE_URL`
+
+## Instalación
+
+Desde esta carpeta:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Editar `.env` y configurar al menos `API_BASE_URL` si el servicio FastAPI
+implementa los endpoints indicados.
+
+## Ejecución
+
+```powershell
+python main.py
+```
+
+Detener con `Ctrl+C`.
+
+## Lanzamiento Rocketbot sin interfaz
+
+El ejecutable integrado documenta oficialmente:
+
+```text
+rocketbot.exe -db=C:\Users\USER\Documents\Rocketbot\robot.db -start=Clima
+```
+
+El módulo `rocketbot_runner.py` construye esa forma sin ejecutar Selenium.
+Incluye `--nodebug` y oculta la ventana del proceso al iniciar en Windows.
+Esto no confirma por sí mismo que Development permita ejecución desatendida:
+la primera ejecución real debe autorizarse explícitamente y debe observarse
+desde una sesión manual de prueba.
+
+## XPath reales validados
+
+Los controles se validaron directamente sobre Rocketbot Studio:
+
+```text
+Run:  //*[@id="__layout"]/main/div/div/div[1]/div[2]/div/button[4]
+Stop: //*[@id="__layout"]/main/div/div/div[1]/div[2]/div/button[5]
+Save: //*[@id="__layout"]/main/div/div/div[1]/div[2]/div/button[3]
+```
+
+En el estado normal se observó `Run` visible/habilitado y `Stop` visible pero
+deshabilitado.
+
+## Prueba segura DRY_RUN
+
+Mantener estas opciones:
+
+```dotenv
+DRY_RUN=true
+ALLOW_REAL_EXECUTION=false
+```
+
+El modo DRY_RUN comprueba el ejecutable, la base de datos y el nombre de robot.
+No abre Chrome, no abre el editor y no inicia `Clima`.
+
+## Ejecución real
+
+No habilitar hasta comprobar:
+
+1. Licencia Development permite explícitamente la automatización normal.
+2. El robot correcto está abierto.
+3. No hay otra ejecución activa.
+4. El botón Play fue detectado sin ambigüedad.
+
+Después configurar `ALLOW_REAL_EXECUTION=true`. `DRY_RUN=false` todavía
+debe conservarse explícitamente. Un reinicio con una ejecución iniciada reporta
+`ESTADO_NO_CONFIRMADO`; no repite el trabajo.
+
+## Logs
+
+- `logs\agent.log`
+- Estado local: `.agent_state.json`
+
+## Compatibilidad FastAPI observada
+
+El API local actual expuso `/health`, `/api/recepcion`, `/api/ejecuciones` y
+`/api/logs`. No expuso los endpoints de cola solicitados:
+
+- `/api/robot/agente/siguiente`
+- `/api/robot/agente/heartbeat`
+- `/api/robot/trabajos/{id}/iniciar`
+- `/api/robot/trabajos/{id}/finalizar`
+
+Por tanto, el agente intenta estos endpoints, registra errores 404 y no
+inventa una cola ni confirma trabajos.

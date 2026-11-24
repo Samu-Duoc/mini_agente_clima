@@ -1,0 +1,80 @@
+import signal
+import threading
+import time
+
+from api_client import ApiClient
+from job_executor import JobExecutor
+from logger import build_logger
+from settings import BASE_DIR, Settings
+
+
+settings = Settings.from_environment()
+logger = build_logger(BASE_DIR)
+api = ApiClient(
+    settings.api_base_url,
+    settings.agent_api_key,
+    settings.agent_id,
+    logger,
+)
+executor = JobExecutor(settings, api, logger)
+stop_event = threading.Event()
+
+
+def handle_stop(_signum=None, _frame=None) -> None:
+    stop_event.set()
+    executor.stop()
+
+
+signal.signal(signal.SIGINT, handle_stop)
+signal.signal(signal.SIGTERM, handle_stop)
+
+
+def heartbeat_loop() -> None:
+    while not stop_event.wait(settings.heartbeat_seconds):
+        api.heartbeat()
+
+
+def main() -> None:
+    logger.info(
+        "Agente iniciado | agent_id=%s | dry_run=%s",
+        settings.agent_id,
+        settings.dry_run,
+    )
+    if not settings.api_base_url:
+        logger.warning("API_BASE_URL no está configurada")
+    executor.check_restart_state()
+    api.report_state("AGENTE_CONECTADO")
+
+    if settings.dry_run:
+        dry_run_result = executor.inspect_dry_run()
+        logger.info(
+            "DRY_RUN iniciado | estado=%s",
+            dry_run_result["estado"],
+        )
+
+    heartbeat = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat.start()
+
+    while not stop_event.is_set():
+        try:
+            response = api.siguiente()
+            if response:
+                jobs = response.get("trabajos")
+                if isinstance(jobs, list):
+                    for job in jobs:
+                        if stop_event.is_set():
+                            break
+                        executor.execute_job(job)
+                elif isinstance(response, dict) and (
+                    response.get("id") or response.get("trabajo_id")
+                ):
+                    executor.execute_job(response)
+        except Exception as exc:
+            logger.exception("Error controlado en el ciclo principal: %s", exc)
+        stop_event.wait(settings.poll_seconds)
+
+    logger.info("Agente detenido")
+
+
+if __name__ == "__main__":
+    main()

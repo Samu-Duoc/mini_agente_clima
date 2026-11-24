@@ -1,0 +1,163 @@
+import json
+import threading
+from pathlib import Path
+from typing import Any, Optional
+
+from api_client import ApiClient
+from rocketbot_runner import RocketbotRunner
+
+
+class JobExecutor:
+    def __init__(self, settings, api: ApiClient, logger) -> None:
+        self.settings = settings
+        self.api = api
+        self.logger = logger
+        self.lock = threading.Lock()
+        self.runner: Optional[RocketbotRunner] = None
+
+        self.runner = RocketbotRunner(
+            executable=self.settings.rocketbot_executable,
+            database=self.settings.robot_database,
+            robot_name=self.settings.robot_name,
+            log_dir=self.settings.rocketbot_log_dir,
+            timeout_seconds=self.settings.execution_timeout_seconds,
+            logger=self.logger,
+        )
+
+    def load_state(self) -> dict[str, Any]:
+        path: Path = self.settings.state_file
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            self.logger.error("No fue posible leer el estado local: %s", exc)
+            return {}
+
+    def save_state(self, state: dict[str, Any]) -> None:
+        temporary = self.settings.state_file.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.settings.state_file)
+
+    def check_restart_state(self) -> None:
+        state = self.load_state()
+        job_id = state.get("job_id")
+        status = state.get("status")
+        if job_id and status in {"EJECUCION_INICIADA", "ejecutando"}:
+            self.logger.warning(
+                "Inconsistencia tras reinicio: el trabajo %s quedó como %s",
+                job_id,
+                status,
+            )
+            self.api.finalizar(
+                job_id,
+                "ESTADO_NO_CONFIRMADO",
+                "El agente se reinició antes de confirmar el resultado",
+            )
+            state["status"] = "ESTADO_NO_CONFIRMADO"
+            state["detail"] = "Reinicio previo a confirmación"
+            self.save_state(state)
+
+    def inspect_dry_run(self) -> dict[str, Any]:
+        check = self.runner.dry_run_check()
+        state = (
+            "ROBOT_PREPARADO"
+            if check["configuracion_ok"]
+            else "ROBOT_NO_CONFIRMADO"
+        )
+        detail = (
+            "DRY_RUN: mecanismo oficial encontrado; ejecutable, base y "
+            "nombre comprobados; Clima no fue iniciado"
+            if check["configuracion_ok"]
+            else "DRY_RUN: ejecutable, base o nombre de robot no disponible"
+        )
+        self.logger.info(
+            "DRY_RUN runner=%s",
+            check,
+        )
+        self.logger.info("DRY_RUN: no se ejecutó el robot")
+        self.save_state(
+            {
+                "status": state,
+                "robot_name": self.settings.robot_name,
+                "dry_run": True,
+                "detail": detail,
+                "runner": check,
+            }
+        )
+        return {
+            "estado": state,
+            "detalle": detail,
+            "robot_seleccionado": check["configuracion_ok"],
+            "runner": check,
+        }
+
+    def execute_job(self, job: dict[str, Any]) -> None:
+        if not self.lock.acquire(blocking=False):
+            self.logger.warning("Ya existe un trabajo local en ejecución")
+            return
+        try:
+            job_id = str(job.get("id") or job.get("trabajo_id") or "")
+            if not job_id:
+                self.logger.warning("Trabajo sin identificador: %r", job)
+                return
+
+            prior = self.load_state()
+            if prior.get("job_id") == job_id:
+                self.logger.warning(
+                    "Trabajo %s ya tiene registro local; no se repetirá",
+                    job_id,
+                )
+                return
+
+            if self.settings.dry_run:
+                result = self.inspect_dry_run()
+                self.api.finalizar(
+                    job_id,
+                    result["estado"],
+                    result["detalle"],
+                )
+                return
+
+            if not self.settings.allowed_real_click:
+                detail = (
+                    "Ejecución real bloqueada: ALLOW_REAL_EXECUTION "
+                    "no está habilitado"
+                )
+                self.logger.warning(detail)
+                self.api.finalizar(job_id, "ESTADO_NO_CONFIRMADO", detail)
+                return
+
+            check = self.runner.dry_run_check()
+            if not check["configuracion_ok"]:
+                detail = "Configuración Rocketbot incompleta"
+                self.api.finalizar(job_id, "ESTADO_NO_CONFIRMADO", detail)
+                return
+
+            started, detail = self.runner.start()
+            if not started:
+                self.api.finalizar(job_id, "ESTADO_NO_CONFIRMADO", detail)
+                return
+
+            self.api.iniciar(job_id)
+            self.save_state(
+                {
+                    "job_id": job_id,
+                    "status": "EJECUCION_INICIADA",
+                    "robot_name": self.settings.robot_name,
+                }
+            )
+            estado, detail = self.runner.wait_for_result()
+            self.api.finalizar(job_id, estado, detail)
+            self.save_state(
+                {
+                    "job_id": job_id,
+                    "status": estado,
+                    "detail": detail,
+                }
+            )
+        finally:
+            self.lock.release()
